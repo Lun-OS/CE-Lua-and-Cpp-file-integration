@@ -3,9 +3,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 // ============================================================
-// CEBridge.h - CE Lua ¸ßĞÔÄÜÇÅ½ÓÍ·ÎÄ¼ş (v3.1 ĞŞ¸´°æ)
-// ĞŞ¸´ÁË¶à´Î¶ÁÈ¡Ê±½á¹û»º´æÎÊÌâ
-// ×÷Õß: Lun + ĞŞ¸´°æ±¾
+// CEBridge.h - CE Lua é«˜æ€§èƒ½æ¡¥æ¥å¤´æ–‡ä»¶ (v3.1 ä¿®å¤ç‰ˆ)
+// æ³•å¾‹é£é™©ç”±è‡ªå·±æ‰¿æ‹…
+// ä½œè€…ï¼šLun. github:Lun-OS  QQ:1596534228
 // ============================================================
 
 #ifndef CE_BRIDGE_OPTIMIZED_H
@@ -42,7 +42,7 @@ namespace CEBridge {
 
     namespace fs = std::filesystem;
 
-    // ==================== ÅäÖÃ½á¹¹ ====================
+    // ==================== é…ç½®ç»“æ„ ====================
     struct BridgeConfig {
         std::string basePath;
         std::string commandFile;
@@ -50,13 +50,13 @@ namespace CEBridge {
         std::string logFile;
         std::string stopFlag;
 
-        int pollMs = 50;                // ÂÖÑ¯¼ä¸ô
-        int idleMs = 1000;              // ¿ÕÏĞ¼ä¸ô
-        int idleThreshold = 5;          // ¿ÕÏĞãĞÖµ
-        int defaultTimeout = 2000;      // Ä¬ÈÏ³¬Ê±
-        int logFlushMs = 10000;         // ÈÕÖ¾Ë¢ĞÂ¼ä¸ô
-        int maxCacheSize = 100;         // ×î´ó»º´æ´óĞ¡
-        int batchReadSize = 64;         // ÅúÁ¿¶ÁÈ¡»º³åÇø´óĞ¡
+        int pollMs = 50;                // è½®è¯¢é—´éš”
+        int idleMs = 1000;              // ç©ºé—²é—´éš”
+        int idleThreshold = 5;          // ç©ºé—²é˜ˆå€¼
+        int defaultTimeout = 2000;      // é»˜è®¤è¶…æ—¶
+        int logFlushMs = 10000;         // æ—¥å¿—åˆ·æ–°é—´éš”
+        int maxCacheSize = 100;         // æœ€å¤§ç¼“å­˜å¤§å°
+        int batchReadSize = 64;         // æ‰¹é‡è¯»å–ç¼“å†²åŒºå¤§å°
         bool verbose = false;
 
         BridgeConfig() {
@@ -85,7 +85,7 @@ namespace CEBridge {
         }
     };
 
-    // ==================== ÃüÁî½á¹û½á¹¹ ====================
+    // ==================== å‘½ä»¤ç»“æœç»“æ„ ====================
     struct CommandResult {
         std::string address;
         std::string value;
@@ -98,7 +98,7 @@ namespace CEBridge {
 
     using LogCallback = std::function<void(const std::string& level, const std::string& msg)>;
 
-    // ==================== ×Ö·û´®³Ø (ÓÅ»¯: ¼õÉÙÖØ¸´×Ö·û´®·ÖÅä) ====================
+    // ==================== å­—ç¬¦ä¸²æ±  (ä¼˜åŒ–: å‡å°‘é‡å¤å­—ç¬¦ä¸²åˆ†é…) ====================
     class StringPool {
     private:
         std::unordered_map<std::string, std::shared_ptr<std::string>> pool_;
@@ -116,7 +116,7 @@ namespace CEBridge {
                 return *it->second;
             }
 
-            // ÏŞÖÆ³Ø´óĞ¡
+            // é™åˆ¶æ± å¤§å°
             if (pool_.size() >= maxSize_) {
                 pool_.clear();
             }
@@ -132,7 +132,7 @@ namespace CEBridge {
         }
     };
 
-    // ==================== Êı×Ö½âÎö»º´æ (ÓÅ»¯: ±ÜÃâÖØ¸´½âÎö) ====================
+    // ==================== æ•°å­—è§£æç¼“å­˜ (ä¼˜åŒ–: é¿å…é‡å¤è§£æ) ====================
     class NumberCache {
     private:
         std::unordered_map<std::string, int64_t> cache_;
@@ -143,7 +143,7 @@ namespace CEBridge {
         std::optional<int64_t> parse(const std::string& str) {
             if (str.empty()) return std::nullopt;
 
-            // ¿ìËÙÂ·¾¶: ¼ì²é»º´æ
+            // å¿«é€Ÿè·¯å¾„: æ£€æŸ¥ç¼“å­˜
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 auto it = cache_.find(str);
@@ -152,7 +152,7 @@ namespace CEBridge {
                 }
             }
 
-            // ½âÎöÊı×Ö
+            // è§£ææ•°å­—
             std::string trimmed = trim(str);
             if (trimmed.empty()) return std::nullopt;
 
@@ -167,7 +167,7 @@ namespace CEBridge {
             int64_t result = 0;
 
             try {
-                // ¼ì²éÊ®Áù½øÖÆ
+                // æ£€æŸ¥åå…­è¿›åˆ¶
                 if (trimmed.size() > pos + 1 && trimmed[pos] == '0' &&
                     (trimmed[pos + 1] == 'x' || trimmed[pos + 1] == 'X')) {
                     result = std::stoll(trimmed.substr(pos + 2), nullptr, 16);
@@ -178,7 +178,7 @@ namespace CEBridge {
 
                 if (isNegative) result = -result;
 
-                // »º´æ½á¹û
+                // ç¼“å­˜ç»“æœ
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (cache_.size() < maxSize_) {
                     cache_[str] = result;
@@ -205,7 +205,7 @@ namespace CEBridge {
         }
     };
 
-    // ==================== ÈÕÖ¾»º³åÇø (ÓÅ»¯: ÅúÁ¿Ğ´Èë) ====================
+    // ==================== æ—¥å¿—ç¼“å†²åŒº (ä¼˜åŒ–: æ‰¹é‡å†™å…¥) ====================
     class LogBuffer {
     private:
         std::vector<std::string> buffer_;
@@ -240,7 +240,7 @@ namespace CEBridge {
             std::lock_guard<std::mutex> lock(mutex_);
             buffer_.push_back(oss.str());
 
-            // ×Ô¶¯Ë¢ĞÂ
+            // è‡ªåŠ¨åˆ·æ–°
             if (shouldFlush()) {
                 flushInternal();
             }
@@ -281,7 +281,7 @@ namespace CEBridge {
         }
     };
 
-    // ==================== Ö÷¿Í»§¶ËÀà ====================
+    // ==================== ä¸»å®¢æˆ·ç«¯ç±» ====================
     class Client {
     public:
         explicit Client(const BridgeConfig& cfg = BridgeConfig());
@@ -294,7 +294,7 @@ namespace CEBridge {
         void cleanup();
         bool isReady() const { return initialized_.load(); }
 
-        // Ö÷Òª½Ó¿Ú
+        // ä¸»è¦æ¥å£
         bool executeCommands(const std::vector<std::string>& commands,
             std::map<std::string, CommandResult>& results,
             int timeout = -1);
@@ -307,11 +307,11 @@ namespace CEBridge {
         bool readPointer(const std::string& baseAddr, const std::vector<std::string>& offsets,
             CommandResult& result, int timeout = -1);
 
-        // ĞÂÔö£º´øÖØÊÔµÄ¶ÁÈ¡½Ó¿Ú
+        // æ–°å¢ï¼šå¸¦é‡è¯•çš„è¯»å–æ¥å£
         bool readMemoryWithRetry(const std::string& address, CommandResult& result,
             int maxRetries = 3, int timeout = -1);
 
-        // ¿ØÖÆ½Ó¿Ú
+        // æ§åˆ¶æ¥å£
         bool sendStopSignal();
         void setLogCallback(LogCallback cb) { logCallback_ = cb; }
 
@@ -330,20 +330,20 @@ namespace CEBridge {
         LogCallback logCallback_;
         std::string lastError_;
 
-        // ÓÅ»¯×é¼ş
+        // ä¼˜åŒ–ç»„ä»¶
         StringPool stringPool_;
         NumberCache numberCache_;
         std::unique_ptr<LogBuffer> logBuffer_;
 
-        // ×´Ì¬¸ú×Ù
+        // çŠ¶æ€è·Ÿè¸ª
         fs::file_time_type lastResultMTime_{};
         std::string lastResultContent_;
         int idleCount_;
 
-        // Ô¤·ÖÅäµÄ»º³åÇø
+        // é¢„åˆ†é…çš„ç¼“å†²åŒº
         std::vector<std::string> resultBuffer_;
 
-        // ¸¨Öúº¯Êı
+        // è¾…åŠ©å‡½æ•°
         void log(const std::string& level, const std::string& msg);
         bool ensureDirectory();
         bool atomicWriteFile(const std::string& path, const std::string& content);
@@ -352,11 +352,11 @@ namespace CEBridge {
         uint64_t getFileMTime(const std::string& path) const;
         void trimString(std::string& s);
 
-        // ĞÂÔö£ºÇåÀí½á¹ûÎÄ¼ş
+        // æ–°å¢ï¼šæ¸…ç†ç»“æœæ–‡ä»¶
         bool cleanupResultFile();
     };
 
-    // ==================== ÊµÏÖ ====================
+    // ==================== å®ç° ====================
 
     inline void Client::trimString(std::string& s) {
         size_t start = s.find_first_not_of(" \t");
@@ -415,7 +415,7 @@ namespace CEBridge {
             if (fs::exists(config_.resultFile)) {
                 fs::remove(config_.resultFile, ec);
                 if (ec) {
-                    log("WARN", std::string("ÇåÀí½á¹ûÎÄ¼şÊ§°Ü: ") + ec.message());
+                    log("WARN", std::string("æ¸…ç†ç»“æœæ–‡ä»¶å¤±è´¥: ") + ec.message());
                     return false;
                 }
             }
@@ -424,7 +424,7 @@ namespace CEBridge {
             return true;
         }
         catch (const std::exception& e) {
-            log("ERROR", std::string("ÇåÀí½á¹ûÎÄ¼şÒì³£: ") + e.what());
+            log("ERROR", std::string("æ¸…ç†ç»“æœæ–‡ä»¶å¼‚å¸¸: ") + e.what());
             return false;
         }
     }
@@ -435,10 +435,10 @@ namespace CEBridge {
         try {
             if (!ensureDirectory()) return false;
 
-            // ³õÊ¼»¯ÈÕÖ¾»º³åÇø
+            // åˆå§‹åŒ–æ—¥å¿—ç¼“å†²åŒº
             logBuffer_ = std::make_unique<LogBuffer>(config_.logFile, config_.logFlushMs);
 
-            // ÇåÀí¾ÉÎÄ¼ş
+            // æ¸…ç†æ—§æ–‡ä»¶
             std::error_code ec;
             fs::remove(config_.resultFile, ec);
             fs::remove(config_.commandFile, ec);
@@ -449,9 +449,9 @@ namespace CEBridge {
             idleCount_ = 0;
 
             initialized_.store(true);
-            log("INFO", "========== Bridge initialized (v3.1 ĞŞ¸´°æ) ==========");
+            log("INFO", "========== Bridge initialized (v3.1 ä¿®å¤ç‰ˆ) ==========");
             log("INFO", std::string("Base path: ") + config_.basePath);
-            log("INFO", "ĞŞ¸´: ¶à´Î¶ÁÈ¡½á¹û»º´æÎÊÌâ");
+            log("INFO", "ä¿®å¤: å¤šæ¬¡è¯»å–ç»“æœç¼“å­˜é—®é¢˜");
 
             return true;
         }
@@ -480,7 +480,7 @@ namespace CEBridge {
         try {
             std::string tmpPath = path + ".tmp";
 
-            // Ğ´ÈëÁÙÊ±ÎÄ¼ş
+            // å†™å…¥ä¸´æ—¶æ–‡ä»¶
             {
                 std::ofstream ofs(tmpPath, std::ios::binary);
                 if (!ofs) {
@@ -491,7 +491,7 @@ namespace CEBridge {
                 ofs.flush();
             }
 
-            // Ô­×ÓÖØÃüÃû
+            // åŸå­é‡å‘½å
             std::error_code ec;
             fs::remove(path, ec);
             fs::rename(tmpPath, path, ec);
@@ -527,7 +527,7 @@ namespace CEBridge {
         auto start = std::chrono::steady_clock::now();
         uint64_t baseline = getFileMTime(config_.resultFile);
 
-        // Èç¹û»ùÏßÊÇ0£¬ËµÃ÷ÎÄ¼ş²»´æÔÚ£¬µÈ´ıËü±»´´½¨
+        // å¦‚æœåŸºçº¿æ˜¯0ï¼Œè¯´æ˜æ–‡ä»¶ä¸å­˜åœ¨ï¼Œç­‰å¾…å®ƒè¢«åˆ›å»º
         if (baseline == 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             baseline = getFileMTime(config_.resultFile);
@@ -537,7 +537,7 @@ namespace CEBridge {
             uint64_t current = getFileMTime(config_.resultFile);
 
             if (current != 0 && current != baseline) {
-                // ¶ÌÔİµÈ´ıÒÔÈ·±£Ğ´ÈëÍê³É
+                // çŸ­æš‚ç­‰å¾…ä»¥ç¡®ä¿å†™å…¥å®Œæˆ
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
                 try {
@@ -547,7 +547,7 @@ namespace CEBridge {
                         oss << ifs.rdbuf();
                         outContent = oss.str();
 
-                        // Ö»ÓĞÔÚ³É¹¦¶ÁÈ¡ÄÚÈİÊ±²Å¸üĞÂ×´Ì¬
+                        // åªæœ‰åœ¨æˆåŠŸè¯»å–å†…å®¹æ—¶æ‰æ›´æ–°çŠ¶æ€
                         if (!outContent.empty()) {
                             lastResultMTime_ = fs::last_write_time(config_.resultFile);
                             lastResultContent_ = outContent;
@@ -561,13 +561,13 @@ namespace CEBridge {
                 }
             }
 
-            // ¶¯Ì¬Ë¯Ãß¼ä¸ô
+            // åŠ¨æ€ç¡çœ é—´éš”
             int sleepMs = (idleCount_ >= config_.idleThreshold) ? config_.idleMs : config_.pollMs;
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
 
             idleCount_++;
 
-            // ¼ì²é³¬Ê±
+            // æ£€æŸ¥è¶…æ—¶
             if (timeoutMs >= 0) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - start).count();
@@ -588,14 +588,14 @@ namespace CEBridge {
         std::string line;
 
         while (std::getline(iss, line)) {
-            // ÒÆ³ıĞĞÎ²µÄ \r
+            // ç§»é™¤è¡Œå°¾çš„ \r
             if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
 
             if (line.empty() || line[0] == '#') continue;
 
-            // ½âÎö¸ñÊ½: KEY = VALUE ; status=... ; msg=... ; ts=...
+            // è§£ææ ¼å¼: KEY = VALUE ; status=... ; msg=... ; ts=...
             size_t eqPos = line.find('=');
             if (eqPos == std::string::npos) continue;
 
@@ -616,7 +616,7 @@ namespace CEBridge {
             }
             trimString(result.value);
 
-            // ½âÎöÊôĞÔ
+            // è§£æå±æ€§
             size_t pos = 0;
             while (pos < rest.size()) {
                 size_t nextSemi = rest.find(';', pos);
@@ -634,7 +634,7 @@ namespace CEBridge {
                 trimString(token);
                 if (token.empty()) continue;
 
-                // ½âÎö key=value
+                // è§£æ key=value
                 size_t tokenEq = token.find('=');
                 if (tokenEq != std::string::npos) {
                     std::string key = token.substr(0, tokenEq);
@@ -642,7 +642,7 @@ namespace CEBridge {
                     trimString(key);
                     trimString(val);
 
-                    // ×ª»»ÎªĞ¡Ğ´±È½Ï
+                    // è½¬æ¢ä¸ºå°å†™æ¯”è¾ƒ
                     for (auto& c : key) c = static_cast<char>(std::tolower(c));
 
                     if (key == "status") {
@@ -682,22 +682,22 @@ namespace CEBridge {
 
         if (timeout < 0) timeout = config_.defaultTimeout;
 
-        // ¹¹½¨ÃüÁîÎÄ±¾
+        // æ„å»ºå‘½ä»¤æ–‡æœ¬
         std::ostringstream oss;
         for (const auto& cmd : commands) {
             oss << cmd << "\n";
         }
         std::string cmdText = oss.str();
 
-        // ´®ĞĞ»¯Ğ´Èë
+        // ä¸²è¡ŒåŒ–å†™å…¥
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // +++ ĞŞ¸´£ºÇ¿ÖÆÇåÀí¾ÉµÄ½á¹ûÎÄ¼ş +++
+        // +++ ä¿®å¤ï¼šå¼ºåˆ¶æ¸…ç†æ—§çš„ç»“æœæ–‡ä»¶ +++
         if (!cleanupResultFile()) {
-            log("WARN", "ÇåÀí½á¹ûÎÄ¼şÊ§°Ü£¬¼ÌĞøÖ´ĞĞ...");
+            log("WARN", "æ¸…ç†ç»“æœæ–‡ä»¶å¤±è´¥ï¼Œç»§ç»­æ‰§è¡Œ...");
         }
 
-        // Ô­×ÓĞ´ÈëÃüÁîÎÄ¼ş
+        // åŸå­å†™å…¥å‘½ä»¤æ–‡ä»¶
         if (!atomicWriteFile(config_.commandFile, cmdText)) {
             log("ERROR", lastError_);
             return false;
@@ -705,16 +705,16 @@ namespace CEBridge {
 
         log("DEBUG", std::string("Executed ") + std::to_string(commands.size()) + " commands");
 
-        // µÈ´ı½á¹û
+        // ç­‰å¾…ç»“æœ
         std::string resultText;
         if (!waitForResultChange(resultText, timeout)) {
             return false;
         }
 
-        // ½âÎö½á¹û
+        // è§£æç»“æœ
         results = parseResults(resultText);
 
-        // +++ ĞŞ¸´£ºÇåÀí×Ö·û´®³Ø£¬±ÜÃâÄÚ´æĞ¹Â© +++
+        // +++ ä¿®å¤ï¼šæ¸…ç†å­—ç¬¦ä¸²æ± ï¼Œé¿å…å†…å­˜æ³„æ¼ +++
         stringPool_.clear();
 
         return !results.empty();
@@ -801,7 +801,7 @@ namespace CEBridge {
             }
 
             if (i < maxRetries - 1) {
-                log("WARN", std::string("¶ÁÈ¡Ê§°Ü£¬ÖØÊÔ ") + std::to_string(i + 1) + "/" + std::to_string(maxRetries));
+                log("WARN", std::string("è¯»å–å¤±è´¥ï¼Œé‡è¯• ") + std::to_string(i + 1) + "/" + std::to_string(maxRetries));
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
@@ -829,5 +829,6 @@ namespace CEBridge {
     }
 
 } // namespace CEBridge
+
 
 #endif // CE_BRIDGE_OPTIMIZED_H
