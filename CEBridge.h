@@ -1,28 +1,18 @@
-#pragma once
-#ifndef _CRT_SECURE_NO_WARNINGS
-#define _CRT_SECURE_NO_WARNINGS
-#endif
+﻿#pragma once
 // ============================================================
-// CEBridge.h - CE Lua 高性能桥接头文件 (v3.1 修复版)
-// 法律风险由自己承担
-// 作者：Lun. github:Lun-OS  QQ:1596534228
+// CEBridge.h - CE Lua 文件通讯桥接库（增强版）
+// 版本: 2.0
+// 新增：模块基址查询、多层指针、断点与寄存器读取
+// 作者：Lun.  QQ:1596534228   github:Lun-OS
+// 此脚本仅供学习，请勿调试于未授权程序，风险由自己承担
 // ============================================================
 
-#ifndef CE_BRIDGE_OPTIMIZED_H
-#define CE_BRIDGE_OPTIMIZED_H
+#ifndef CE_BRIDGE_H
+#define CE_BRIDGE_H
 
 #include <string>
-#include <string_view>
 #include <vector>
 #include <map>
-#include <cstdlib>
-#include <ctime>
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
-#include <Windows.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -30,805 +20,907 @@
 #include <thread>
 #include <functional>
 #include <mutex>
-#include <atomic>
-#include <unordered_map>
-#include <optional>
-#include <iostream>
-#include <iomanip>
-#include <array>
-#include <memory>
 
 namespace CEBridge {
 
     namespace fs = std::filesystem;
 
-    // ==================== 配置结构 ====================
+    // ==================== 结果结构体 ====================
+    struct CommandResult {
+        std::string address;      // 地址（字符串形式）
+        std::string value;        // 值（字符串形式）
+        std::string status;       // 状态: "OK" 或 "ERR"
+        std::string message;      // 附加消息
+
+        bool isSuccess() const { return status == "OK"; }
+
+        int getIntValue() const {
+            try { return std::stoi(value); }
+            catch (...) { return 0; }
+        }
+
+        uint64_t getAddressValue() const {
+            try { return std::stoull(value, nullptr, 16); }
+            catch (...) { return 0; }
+        }
+
+        float getFloatValue() const {
+            try { return std::stof(value); }
+            catch (...) { return 0.0f; }
+        }
+    };
+
+    // ==================== 配置结构体 ====================
     struct BridgeConfig {
-        std::string basePath;
-        std::string commandFile;
-        std::string resultFile;
-        std::string logFile;
-        std::string stopFlag;
+        std::string basePath = []() {
+            char* localAppData = nullptr;
+            size_t len = 0;
+            errno_t err = _dupenv_s(&localAppData, &len, "LOCALAPPDATA");
 
-        int pollMs = 50;                // 轮询间隔
-        int idleMs = 1000;              // 空闲间隔
-        int idleThreshold = 5;          // 空闲阈值
-        int defaultTimeout = 2000;      // 默认超时
-        int logFlushMs = 10000;         // 日志刷新间隔
-        int maxCacheSize = 100;         // 最大缓存大小
-        int batchReadSize = 64;         // 批量读取缓冲区大小
-        bool verbose = false;
-
-        BridgeConfig() {
-            // Use secure environment access on MSVC
-#if defined(_WIN32)
-            char* envBuf = nullptr;
-            size_t envLen = 0;
-            if (_dupenv_s(&envBuf, &envLen, "LOCALAPPDATA") == 0 && envBuf != nullptr) {
-                basePath = std::string(envBuf) + "\\Temp\\QAQ\\";
-                free(envBuf);
+            std::string path;
+            if (err == 0 && localAppData != nullptr) {
+                path = std::string(localAppData) + "\\Temp\\QAQ\\";
+                free(localAppData);
             }
             else {
-                basePath = ".\\Temp\\QAQ\\";
+                path = ".\\Temp\\QAQ\\";
             }
-#else
-            const char* env = std::getenv("LOCALAPPDATA");
-            basePath = env ? (std::string(env) + "\\Temp\\QAQ\\") : ".\\Temp\\QAQ\\";
-#endif
 
-            if (basePath.back() != '\\' && basePath.back() != '/') basePath += "\\";
+            std::replace(path.begin(), path.end(), '\\', '/');
+            return path;
+            }();
 
-            commandFile = basePath + "command.txt";
-            resultFile = basePath + "result.txt";
-            logFile = basePath + "bridge_log.txt";
-            stopFlag = basePath + "stop.flag";
-        }
+        int defaultTimeout = 1000;
+        int retryCount = 5;
+        int retryDelay = 500;
+        bool autoCleanup = true;
+        bool verboseLogging = false;
     };
 
-    // ==================== 命令结果结构 ====================
-    struct CommandResult {
-        std::string address;
-        std::string value;
-        std::string status;
-        std::string message;
-        int64_t timestamp = 0;
+    // ==================== 日志回调函数类型 ====================
+    using LogCallback = std::function<void(const std::string& level, const std::string& message)>;
 
-        bool isOK() const { return status == "OK"; }
-    };
-
-    using LogCallback = std::function<void(const std::string& level, const std::string& msg)>;
-
-    // ==================== 字符串池 (优化: 减少重复字符串分配) ====================
-    class StringPool {
-    private:
-        std::unordered_map<std::string, std::shared_ptr<std::string>> pool_;
-        mutable std::mutex mutex_;
-        size_t maxSize_ = 1000;
-
-    public:
-        std::string_view intern(const std::string& str) {
-            if (str.empty()) return {};
-
-            std::lock_guard<std::mutex> lock(mutex_);
-
-            auto it = pool_.find(str);
-            if (it != pool_.end()) {
-                return *it->second;
-            }
-
-            // 限制池大小
-            if (pool_.size() >= maxSize_) {
-                pool_.clear();
-            }
-
-            auto ptr = std::make_shared<std::string>(str);
-            pool_[str] = ptr;
-            return *ptr;
-        }
-
-        void clear() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            pool_.clear();
-        }
-    };
-
-    // ==================== 数字解析缓存 (优化: 避免重复解析) ====================
-    class NumberCache {
-    private:
-        std::unordered_map<std::string, int64_t> cache_;
-        mutable std::mutex mutex_;
-        size_t maxSize_ = 1000;
-
-    public:
-        std::optional<int64_t> parse(const std::string& str) {
-            if (str.empty()) return std::nullopt;
-
-            // 快速路径: 检查缓存
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto it = cache_.find(str);
-                if (it != cache_.end()) {
-                    return it->second;
-                }
-            }
-
-            // 解析数字
-            std::string trimmed = trim(str);
-            if (trimmed.empty()) return std::nullopt;
-
-            bool isNegative = false;
-            size_t pos = 0;
-
-            if (trimmed[0] == '-') {
-                isNegative = true;
-                pos = 1;
-            }
-
-            int64_t result = 0;
-
-            try {
-                // 检查十六进制
-                if (trimmed.size() > pos + 1 && trimmed[pos] == '0' &&
-                    (trimmed[pos + 1] == 'x' || trimmed[pos + 1] == 'X')) {
-                    result = std::stoll(trimmed.substr(pos + 2), nullptr, 16);
-                }
-                else {
-                    result = std::stoll(trimmed, nullptr, 10);
-                }
-
-                if (isNegative) result = -result;
-
-                // 缓存结果
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (cache_.size() < maxSize_) {
-                    cache_[str] = result;
-                }
-
-                return result;
-            }
-            catch (...) {
-                return std::nullopt;
-            }
-        }
-
-        void clear() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cache_.clear();
-        }
-
-    private:
-        static std::string trim(const std::string& str) {
-            size_t start = str.find_first_not_of(" \t\r\n");
-            if (start == std::string::npos) return "";
-            size_t end = str.find_last_not_of(" \t\r\n");
-            return str.substr(start, end - start + 1);
-        }
-    };
-
-    // ==================== 日志缓冲区 (优化: 批量写入) ====================
-    class LogBuffer {
-    private:
-        std::vector<std::string> buffer_;
-        std::string logFile_;
-        std::chrono::steady_clock::time_point lastFlush_;
-        int flushIntervalMs_;
-        mutable std::mutex mutex_;
-
-        static constexpr size_t MAX_BUFFER_SIZE = 100;
-
-    public:
-        LogBuffer(const std::string& logFile, int flushMs)
-            : logFile_(logFile), flushIntervalMs_(flushMs) {
-            lastFlush_ = std::chrono::steady_clock::now();
-        }
-
-        void log(const std::string& level, const std::string& msg) {
-            auto now = std::chrono::system_clock::now();
-            auto time = std::chrono::system_clock::to_time_t(now);
-
-            std::ostringstream oss;
-#if defined(_MSC_VER)
-            std::tm tm;
-            localtime_s(&tm, &time);
-            oss << "[" << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] "
-                << level << " " << msg << "\n";
-#else
-            oss << "[" << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S") << "] "
-                << level << " " << msg << "\n";
-#endif
-
-            std::lock_guard<std::mutex> lock(mutex_);
-            buffer_.push_back(oss.str());
-
-            // 自动刷新
-            if (shouldFlush()) {
-                flushInternal();
-            }
-        }
-
-        void flush() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            flushInternal();
-        }
-
-    private:
-        bool shouldFlush() const {
-            if (buffer_.size() >= MAX_BUFFER_SIZE) return true;
-
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - lastFlush_).count();
-
-            return elapsed >= flushIntervalMs_;
-        }
-
-        void flushInternal() {
-            if (buffer_.empty()) return;
-
-            try {
-                std::ofstream ofs(logFile_, std::ios::app | std::ios::binary);
-                if (ofs) {
-                    for (const auto& line : buffer_) {
-                        ofs << line;
-                    }
-                    ofs.close();
-                }
-            }
-            catch (...) {}
-
-            buffer_.clear();
-            lastFlush_ = std::chrono::steady_clock::now();
-        }
-    };
-
-    // ==================== 主客户端类 ====================
+    // ==================== CEBridge 主类 ====================
     class Client {
     public:
-        explicit Client(const BridgeConfig& cfg = BridgeConfig());
+        explicit Client(const BridgeConfig& config = BridgeConfig());
         ~Client();
 
         Client(const Client&) = delete;
         Client& operator=(const Client&) = delete;
 
+        // -------------------- 初始化与清理 --------------------
         bool initialize();
         void cleanup();
-        bool isReady() const { return initialized_.load(); }
+        bool isReady() const { return m_initialized; }
 
-        // 主要接口
+        // -------------------- 基础内存操作 --------------------
+
+        // 读取内存（支持模块名+偏移格式，如 "game.exe+0x1234"）
+        bool readMemory(const std::string& address, CommandResult& result, int timeout = -1);
+        bool readMemory(uint64_t address, CommandResult& result, int timeout = -1);
+
+        // 写入内存（支持模块名+偏移格式）
+        bool writeMemory(const std::string& address, int value, CommandResult& result, int timeout = -1);
+        bool writeMemory(uint64_t address, int value, CommandResult& result, int timeout = -1);
+
+        // -------------------- 指针操作 --------------------
+
+        // 单层指针：readPointer(base, offset)
+        bool readPointer(uint64_t base, uint64_t offset, CommandResult& result, int timeout = -1);
+
+        // 多层指针：readPointerChain(base, {offset1, offset2, offset3, ...})
+        bool readPointerChain(uint64_t base, const std::vector<uint64_t>& offsets,
+            CommandResult& result, int timeout = -1);
+
+        // 多层指针（支持模块名）：readPointerChain("game.exe+0x1234", {0x18, 0x20, 0x10})
+        bool readPointerChain(const std::string& base, const std::vector<uint64_t>& offsets,
+            CommandResult& result, int timeout = -1);
+
+        // -------------------- 模块操作 --------------------
+
+        // 获取模块基址
+        bool getModuleBase(const std::string& moduleName, uint64_t& baseAddress, int timeout = -1);
+
+        // 从模块偏移读取内存
+        bool readModuleOffset(const std::string& moduleName, uint64_t offset,
+            CommandResult& result, int timeout = -1);
+
+        // 向模块偏移写入内存
+        bool writeModuleOffset(const std::string& moduleName, uint64_t offset, int value,
+            CommandResult& result, int timeout = -1);
+
+        // -------------------- 断点与寄存器 --------------------
+
+        // 设置断点（支持模块名+偏移）
+        bool setBreakpoint(const std::string& address, int timeout = -1);
+        bool setBreakpoint(uint64_t address, int timeout = -1);
+
+        // 移除断点
+        bool removeBreakpoint(const std::string& address, int timeout = -1);
+        bool removeBreakpoint(uint64_t address, int timeout = -1);
+
+        // 获取所有寄存器值
+        bool getRegisters(std::map<std::string, uint64_t>& registers, int timeout = -1);
+
+        // 获取单个寄存器值
+        bool getRegister(const std::string& regName, uint64_t& value, int timeout = -1);
+
+        // -------------------- 批量操作 --------------------
+
+        // 批量执行命令
         bool executeCommands(const std::vector<std::string>& commands,
             std::map<std::string, CommandResult>& results,
             int timeout = -1);
 
-        bool readMemory(const std::string& address, CommandResult& result, int timeout = -1);
-        bool writeMemory(const std::string& address, const std::string& value,
-            CommandResult& result, int timeout = -1);
+        // 发送自定义命令
+        bool sendCustomCommand(const std::string& command, int timeout = -1);
 
-        bool getModuleBase(const std::string& moduleName, CommandResult& result, int timeout = -1);
-        bool readPointer(const std::string& baseAddr, const std::vector<std::string>& offsets,
-            CommandResult& result, int timeout = -1);
+        // -------------------- 高级功能 --------------------
 
-        // 新增：带重试的读取接口
-        bool readMemoryWithRetry(const std::string& address, CommandResult& result,
-            int maxRetries = 3, int timeout = -1);
+        // 等待内存值变化
+        bool waitForValueChange(uint64_t address, int currentValue,
+            CommandResult& result, int timeout = -1, int pollInterval = 100);
 
-        // 控制接口
+        // 批量读取连续地址
+        bool readMemoryRange(uint64_t startAddress, int count, int step,
+            std::vector<CommandResult>& results, int timeout = -1);
+
+        // -------------------- 控制操作 --------------------
+
         bool sendStopSignal();
-        void setLogCallback(LogCallback cb) { logCallback_ = cb; }
+        bool waitForLuaStop(int timeout = 5000);
 
-        std::string getLastError() const {
-            std::lock_guard<std::mutex> lock(mutex_);
-            return lastError_;
-        }
+        // -------------------- 实用工具 --------------------
 
-        const BridgeConfig& getConfig() const { return config_; }
+        void setLogCallback(LogCallback callback) { m_logCallback = callback; }
+        const BridgeConfig& getConfig() const { return m_config; }
+        void updateConfig(const BridgeConfig& config) { m_config = config; }
+        std::string getLastError() const { return m_lastError; }
+        bool isLuaRunning(int timeout = 2000);
+        std::vector<std::string> readLuaLog(int lastNLines = 10);
+
+        // -------------------- 静态命令生成器 --------------------
+
+        static std::string makeReadCommand(const std::string& address);
+        static std::string makeReadCommand(uint64_t address);
+
+        static std::string makeWriteCommand(const std::string& address, int value);
+        static std::string makeWriteCommand(uint64_t address, int value);
+
+        static std::string makePointerCommand(uint64_t base, uint64_t offset);
+        static std::string makePointerChainCommand(uint64_t base, const std::vector<uint64_t>& offsets);
+        static std::string makePointerChainCommand(const std::string& base, const std::vector<uint64_t>& offsets);
+
+        static std::string makeModuleCommand(const std::string& moduleName);
+        static std::string makeBreakpointCommand(const std::string& address);
+        static std::string makeRemoveBreakpointCommand(const std::string& address);
+        static std::string makeGetRegistersCommand();
+
+        static std::string formatAddress(uint64_t address);
+        static uint64_t parseAddress(const std::string& addressStr);
 
     private:
-        BridgeConfig config_;
-        std::atomic<bool> initialized_;
-        mutable std::mutex mutex_;
+        BridgeConfig m_config;
 
-        LogCallback logCallback_;
-        std::string lastError_;
+        std::string m_commandFile;
+        std::string m_resultFile;
+        std::string m_logFile;
+        std::string m_stopFlag;
 
-        // 优化组件
-        StringPool stringPool_;
-        NumberCache numberCache_;
-        std::unique_ptr<LogBuffer> logBuffer_;
+        bool m_initialized;
+        fs::file_time_type m_lastResultMTime;
+        std::string m_lastError;
 
-        // 状态跟踪
-        fs::file_time_type lastResultMTime_{};
-        std::string lastResultContent_;
-        int idleCount_;
+        LogCallback m_logCallback;
+        std::mutex m_mutex;
 
-        // 预分配的缓冲区
-        std::vector<std::string> resultBuffer_;
-
-        // 辅助函数
-        void log(const std::string& level, const std::string& msg);
-        bool ensureDirectory();
-        bool atomicWriteFile(const std::string& path, const std::string& content);
-        bool waitForResultChange(std::string& outContent, int timeoutMs);
-        std::map<std::string, CommandResult> parseResults(const std::string& text);
-        uint64_t getFileMTime(const std::string& path) const;
-        void trimString(std::string& s);
-
-        // 新增：清理结果文件
-        bool cleanupResultFile();
+        bool atomicWriteCommand(const std::string& content);
+        bool waitForResult(int timeout);
+        bool parseResultFile(std::map<std::string, CommandResult>& results);
+        void log(const std::string& level, const std::string& message);
+        void setError(const std::string& error);
+        std::string getFullPath(const std::string& filename) const;
+        bool fileExists(const std::string& filepath) const;
+        bool removeFile(const std::string& filepath);
     };
 
-    // ==================== 实现 ====================
+    // ==================== 实现部分 ====================
 
-    inline void Client::trimString(std::string& s) {
-        size_t start = s.find_first_not_of(" \t");
-        if (start == std::string::npos) {
-            s.clear();
-            return;
-        }
-        size_t end = s.find_last_not_of(" \t");
-        s = s.substr(start, end - start + 1);
-    }
-
-    inline Client::Client(const BridgeConfig& cfg)
-        : config_(cfg), initialized_(false),
-        lastResultMTime_{},
-        idleCount_(0) {
-        resultBuffer_.reserve(config_.batchReadSize);
+    inline Client::Client(const BridgeConfig& config)
+        : m_config(config)
+        , m_commandFile(config.basePath + "command.txt")
+        , m_resultFile(config.basePath + "result.txt")
+        , m_logFile(config.basePath + "bridge_log.txt")
+        , m_stopFlag(config.basePath + "stop.flag")
+        , m_initialized(false)
+        , m_lastResultMTime{}
+        , m_logCallback(nullptr)
+    {
     }
 
     inline Client::~Client() {
-        if (initialized_.load()) {
+        if (m_config.autoCleanup) {
             cleanup();
         }
     }
 
-    inline void Client::log(const std::string& level, const std::string& msg) {
-        if (logCallback_) {
-            logCallback_(level, msg);
-        }
-
-        if (config_.verbose) {
-            std::cerr << "[" << level << "] " << msg << std::endl;
-        }
-
-        if (logBuffer_) {
-            logBuffer_->log(level, msg);
-        }
-    }
-
-    inline bool Client::ensureDirectory() {
-        try {
-            fs::path p(config_.basePath);
-            if (!fs::exists(p)) {
-                fs::create_directories(p);
-            }
-            return true;
-        }
-        catch (const std::exception& e) {
-            lastError_ = std::string("create dir failed: ") + e.what();
-            return false;
-        }
-    }
-
-    inline bool Client::cleanupResultFile() {
-        try {
-            std::error_code ec;
-            if (fs::exists(config_.resultFile)) {
-                fs::remove(config_.resultFile, ec);
-                if (ec) {
-                    log("WARN", std::string("清理结果文件失败: ") + ec.message());
-                    return false;
-                }
-            }
-            lastResultContent_.clear();
-            lastResultMTime_ = fs::file_time_type{};
-            return true;
-        }
-        catch (const std::exception& e) {
-            log("ERROR", std::string("清理结果文件异常: ") + e.what());
-            return false;
-        }
-    }
-
     inline bool Client::initialize() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(m_mutex);
 
         try {
-            if (!ensureDirectory()) return false;
+            if (!fs::exists(m_config.basePath)) {
+                fs::create_directories(m_config.basePath);
+                log("INFO", "已创建目录: " + m_config.basePath);
+            }
 
-            // 初始化日志缓冲区
-            logBuffer_ = std::make_unique<LogBuffer>(config_.logFile, config_.logFlushMs);
+            removeFile(m_commandFile);
+            removeFile(m_resultFile);
+            removeFile(m_stopFlag);
 
-            // 清理旧文件
-            std::error_code ec;
-            fs::remove(config_.resultFile, ec);
-            fs::remove(config_.commandFile, ec);
-            fs::remove(config_.stopFlag, ec);
+            m_lastResultMTime = fs::file_time_type::min();
 
-            lastResultMTime_ = fs::file_time_type{};
-            lastResultContent_.clear();
-            idleCount_ = 0;
-
-            initialized_.store(true);
-            log("INFO", "========== Bridge initialized (v3.1 修复版) ==========");
-            log("INFO", std::string("Base path: ") + config_.basePath);
-            log("INFO", "修复: 多次读取结果缓存问题");
-
+            m_initialized = true;
+            log("INFO", "桥接初始化成功");
             return true;
         }
         catch (const std::exception& e) {
-            lastError_ = std::string("init failed: ") + e.what();
-            log("ERROR", lastError_);
+            setError(std::string("初始化失败: ") + e.what());
+            log("ERROR", m_lastError);
             return false;
         }
     }
 
     inline void Client::cleanup() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-        if (logBuffer_) {
-            logBuffer_->flush();
+        try {
+            removeFile(m_commandFile);
+            removeFile(m_resultFile);
+            removeFile(m_stopFlag);
+            log("INFO", "文件清理完成");
+        }
+        catch (const std::exception& e) {
+            log("WARN", std::string("清理时出错: ") + e.what());
         }
 
-        initialized_.store(false);
-        stringPool_.clear();
-        numberCache_.clear();
-
-        log("INFO", "========== Bridge cleaned up ==========");
+        m_initialized = false;
     }
 
-    inline bool Client::atomicWriteFile(const std::string& path, const std::string& content) {
-        try {
-            std::string tmpPath = path + ".tmp";
+    // -------------------- 基础内存操作实现 --------------------
 
-            // 写入临时文件
+    inline bool Client::readMemory(const std::string& address, CommandResult& result, int timeout) {
+        std::string cmd = makeReadCommand(address);
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        // 查找结果（可能是原始地址或解析后的地址）
+        auto it = results.find(address);
+        if (it != results.end()) {
+            result = it->second;
+            return result.isSuccess();
+        }
+
+        // 如果没找到，取第一个结果
+        if (!results.empty()) {
+            result = results.begin()->second;
+            return result.isSuccess();
+        }
+
+        setError("未找到地址 " + address + " 的结果");
+        return false;
+    }
+
+    inline bool Client::readMemory(uint64_t address, CommandResult& result, int timeout) {
+        return readMemory(formatAddress(address), result, timeout);
+    }
+
+    inline bool Client::writeMemory(const std::string& address, int value, CommandResult& result, int timeout) {
+        std::string cmd = makeWriteCommand(address, value);
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        auto it = results.find(address);
+        if (it != results.end()) {
+            result = it->second;
+            return result.isSuccess();
+        }
+
+        if (!results.empty()) {
+            result = results.begin()->second;
+            return result.isSuccess();
+        }
+
+        setError("写入后未能验证地址 " + address);
+        return false;
+    }
+
+    inline bool Client::writeMemory(uint64_t address, int value, CommandResult& result, int timeout) {
+        return writeMemory(formatAddress(address), value, result, timeout);
+    }
+
+    // -------------------- 指针操作实现 --------------------
+
+    inline bool Client::readPointer(uint64_t base, uint64_t offset, CommandResult& result, int timeout) {
+        std::string cmd = makePointerCommand(base, offset);
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        if (!results.empty()) {
+            result = results.begin()->second;
+            return result.isSuccess();
+        }
+
+        setError("未获取到指针结果");
+        return false;
+    }
+
+    inline bool Client::readPointerChain(uint64_t base, const std::vector<uint64_t>& offsets,
+        CommandResult& result, int timeout) {
+        std::string cmd = makePointerChainCommand(base, offsets);
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        if (!results.empty()) {
+            result = results.begin()->second;
+            return result.isSuccess();
+        }
+
+        setError("未获取到多层指针结果");
+        return false;
+    }
+
+    inline bool Client::readPointerChain(const std::string& base, const std::vector<uint64_t>& offsets,
+        CommandResult& result, int timeout) {
+        std::string cmd = makePointerChainCommand(base, offsets);
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        if (!results.empty()) {
+            result = results.begin()->second;
+            return result.isSuccess();
+        }
+
+        setError("未获取到多层指针结果");
+        return false;
+    }
+
+    // -------------------- 模块操作实现 --------------------
+
+    inline bool Client::getModuleBase(const std::string& moduleName, uint64_t& baseAddress, int timeout) {
+        std::string cmd = makeModuleCommand(moduleName);
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        auto it = results.find(moduleName);
+        if (it != results.end() && it->second.isSuccess()) {
+            baseAddress = it->second.getAddressValue();
+            return true;
+        }
+
+        setError("无法获取模块 " + moduleName + " 的基址");
+        return false;
+    }
+
+    inline bool Client::readModuleOffset(const std::string& moduleName, uint64_t offset,
+        CommandResult& result, int timeout) {
+        std::ostringstream oss;
+        oss << moduleName << "+" << formatAddress(offset);
+        return readMemory(oss.str(), result, timeout);
+    }
+
+    inline bool Client::writeModuleOffset(const std::string& moduleName, uint64_t offset, int value,
+        CommandResult& result, int timeout) {
+        std::ostringstream oss;
+        oss << moduleName << "+" << formatAddress(offset);
+        return writeMemory(oss.str(), value, result, timeout);
+    }
+
+    // -------------------- 断点与寄存器实现 --------------------
+
+    inline bool Client::setBreakpoint(const std::string& address, int timeout) {
+        std::string cmd = makeBreakpointCommand(address);
+        return sendCustomCommand(cmd, timeout);
+    }
+
+    inline bool Client::setBreakpoint(uint64_t address, int timeout) {
+        return setBreakpoint(formatAddress(address), timeout);
+    }
+
+    inline bool Client::removeBreakpoint(const std::string& address, int timeout) {
+        std::string cmd = makeRemoveBreakpointCommand(address);
+        return sendCustomCommand(cmd, timeout);
+    }
+
+    inline bool Client::removeBreakpoint(uint64_t address, int timeout) {
+        return removeBreakpoint(formatAddress(address), timeout);
+    }
+
+    inline bool Client::getRegisters(std::map<std::string, uint64_t>& registers, int timeout) {
+        std::string cmd = makeGetRegistersCommand();
+        std::map<std::string, CommandResult> results;
+
+        if (!executeCommands({ cmd }, results, timeout)) {
+            return false;
+        }
+
+        registers.clear();
+        for (const auto& [key, result] : results) {
+            if (result.isSuccess() && key != "REGS") {
+                registers[key] = result.getAddressValue();
+            }
+        }
+
+        return !registers.empty();
+    }
+
+    inline bool Client::getRegister(const std::string& regName, uint64_t& value, int timeout) {
+        std::map<std::string, uint64_t> registers;
+        if (!getRegisters(registers, timeout)) {
+            return false;
+        }
+
+        auto it = registers.find(regName);
+        if (it != registers.end()) {
+            value = it->second;
+            return true;
+        }
+
+        setError("寄存器 " + regName + " 未找到");
+        return false;
+    }
+
+    // -------------------- 批量操作实现 --------------------
+
+    inline bool Client::executeCommands(const std::vector<std::string>& commands,
+        std::map<std::string, CommandResult>& results,
+        int timeout) {
+        if (!m_initialized) {
+            setError("桥接未初始化");
+            return false;
+        }
+
+        if (commands.empty()) {
+            setError("命令列表为空");
+            return false;
+        }
+
+        if (timeout < 0) {
+            timeout = m_config.defaultTimeout;
+        }
+
+        std::ostringstream oss;
+        for (const auto& cmd : commands) {
+            oss << cmd << "\n";
+        }
+
+        bool writeSuccess = false;
+        for (int i = 0; i < m_config.retryCount; ++i) {
+            if (atomicWriteCommand(oss.str())) {
+                writeSuccess = true;
+                break;
+            }
+            if (i < m_config.retryCount - 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(m_config.retryDelay));
+            }
+        }
+
+        if (!writeSuccess) {
+            setError("命令写入失败");
+            return false;
+        }
+
+        if (!waitForResult(timeout)) {
+            setError("等待结果超时");
+            return false;
+        }
+
+        return parseResultFile(results);
+    }
+
+    inline bool Client::sendCustomCommand(const std::string& command, int timeout) {
+        std::map<std::string, CommandResult> results;
+        return executeCommands({ command }, results, timeout);
+    }
+
+    // -------------------- 高级功能实现 --------------------
+
+    inline bool Client::waitForValueChange(uint64_t address, int currentValue,
+        CommandResult& result, int timeout, int pollInterval) {
+        if (timeout < 0) {
+            timeout = m_config.defaultTimeout;
+        }
+
+        auto startTime = std::chrono::steady_clock::now();
+
+        while (true) {
+            if (readMemory(address, result, pollInterval)) {
+                int newValue = result.getIntValue();
+                if (newValue != currentValue) {
+                    log("INFO", "检测到值变化: " + std::to_string(currentValue) +
+                        " -> " + std::to_string(newValue));
+                    return true;
+                }
+            }
+
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > timeout) {
+                setError("等待值变化超时");
+                return false;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(pollInterval));
+        }
+    }
+
+    inline bool Client::readMemoryRange(uint64_t startAddress, int count, int step,
+        std::vector<CommandResult>& results, int timeout) {
+        std::vector<std::string> commands;
+        for (int i = 0; i < count; ++i) {
+            uint64_t addr = startAddress + (i * step);
+            commands.push_back(makeReadCommand(addr));
+        }
+
+        std::map<std::string, CommandResult> resultMap;
+        if (!executeCommands(commands, resultMap, timeout)) {
+            return false;
+        }
+
+        results.clear();
+        for (const auto& [addr, result] : resultMap) {
+            results.push_back(result);
+        }
+
+        return !results.empty();
+    }
+
+    // -------------------- 控制操作实现 --------------------
+
+    inline bool Client::sendStopSignal() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        try {
+            std::ofstream ofs(m_stopFlag);
+            if (!ofs) {
+                setError("无法创建停止标志文件");
+                return false;
+            }
+            ofs << "STOP";
+            log("INFO", "已发送停止信号");
+            return true;
+        }
+        catch (const std::exception& e) {
+            setError(std::string("发送停止信号失败: ") + e.what());
+            return false;
+        }
+    }
+
+    inline bool Client::waitForLuaStop(int timeout) {
+        auto startTime = std::chrono::steady_clock::now();
+
+        while (true) {
+            auto logs = readLuaLog(5);
+            for (const auto& line : logs) {
+                if (line.find("Bridge stopped normally") != std::string::npos) {
+                    log("INFO", "确认 Lua 端已正常停止");
+                    return true;
+                }
+            }
+
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > timeout) {
+                setError("等待 Lua 停止超时");
+                return false;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+
+    inline bool Client::isLuaRunning(int timeout) {
+        if (!fileExists(m_logFile)) {
+            return false;
+        }
+
+        try {
+            auto mtime1 = fs::last_write_time(m_logFile);
+            std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+
+            if (!fileExists(m_logFile)) {
+                return false;
+            }
+
+            auto mtime2 = fs::last_write_time(m_logFile);
+            return mtime2 > mtime1;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    inline std::vector<std::string> Client::readLuaLog(int lastNLines) {
+        std::vector<std::string> lines;
+
+        try {
+            if (!fileExists(m_logFile)) {
+                return lines;
+            }
+
+            std::ifstream ifs(m_logFile);
+            if (!ifs) {
+                return lines;
+            }
+
+            std::string line;
+            std::vector<std::string> allLines;
+            while (std::getline(ifs, line)) {
+                allLines.push_back(line);
+            }
+
+            int start = std::max(0, static_cast<int>(allLines.size()) - lastNLines);
+            for (int i = start; i < allLines.size(); ++i) {
+                lines.push_back(allLines[i]);
+            }
+        }
+        catch (...) {
+        }
+
+        return lines;
+    }
+
+    // -------------------- 内部方法实现 --------------------
+
+    inline bool Client::atomicWriteCommand(const std::string& content) {
+        const std::string tmpFile = m_config.basePath + "command.tmp";
+
+        try {
             {
-                std::ofstream ofs(tmpPath, std::ios::binary);
+                std::ofstream ofs(tmpFile, std::ios::binary);
                 if (!ofs) {
-                    lastError_ = "failed to open temp file: " + tmpPath;
                     return false;
                 }
                 ofs << content;
                 ofs.flush();
             }
 
-            // 原子重命名
-            std::error_code ec;
-            fs::remove(path, ec);
-            fs::rename(tmpPath, path, ec);
-
-            if (ec) {
-                lastError_ = std::string("atomic rename failed: ") + ec.message();
-                fs::remove(tmpPath, ec);
-                return false;
+            if (fileExists(m_commandFile)) {
+                removeFile(m_commandFile);
             }
+            fs::rename(tmpFile, m_commandFile);
 
+            log("DEBUG", "命令已写入");
             return true;
         }
         catch (const std::exception& e) {
-            lastError_ = std::string("atomic write exception: ") + e.what();
+            setError(std::string("写入命令失败: ") + e.what());
             return false;
         }
     }
 
-    inline uint64_t Client::getFileMTime(const std::string& path) const {
-        try {
-            if (!fs::exists(path)) return 0;
+    inline bool Client::waitForResult(int timeout) {
+        auto startTime = std::chrono::steady_clock::now();
 
-            auto ftime = fs::last_write_time(path);
-            auto sctp = std::chrono::time_point_cast<std::chrono::milliseconds>(ftime);
-            return static_cast<uint64_t>(sctp.time_since_epoch().count());
+        while (true) {
+            try {
+                if (!fileExists(m_resultFile)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                    auto elapsed = std::chrono::steady_clock::now() - startTime;
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > timeout) {
+                        return false;
+                    }
+                    continue;
+                }
+
+                auto currentMTime = fs::last_write_time(m_resultFile);
+
+                if (currentMTime > m_lastResultMTime) {
+                    m_lastResultMTime = currentMTime;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    return true;
+                }
+            }
+            catch (const std::exception& e) {
+                log("WARN", std::string("等待结果时出错: ") + e.what());
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > timeout) {
+                return false;
+            }
+        }
+    }
+
+    inline bool Client::parseResultFile(std::map<std::string, CommandResult>& results) {
+        results.clear();
+
+        try {
+            std::ifstream ifs(m_resultFile);
+            if (!ifs) {
+                setError("无法打开结果文件");
+                return false;
+            }
+
+            std::string line;
+            while (std::getline(ifs, line)) {
+                CommandResult result;
+
+                size_t eqPos = line.find('=');
+                if (eqPos == std::string::npos) continue;
+
+                result.address = line.substr(0, eqPos);
+                result.address.erase(0, result.address.find_first_not_of(" \t"));
+                result.address.erase(result.address.find_last_not_of(" \t") + 1);
+
+                size_t semiPos = line.find(';', eqPos);
+                if (semiPos != std::string::npos) {
+                    result.value = line.substr(eqPos + 1, semiPos - eqPos - 1);
+                }
+                else {
+                    result.value = line.substr(eqPos + 1);
+                }
+                result.value.erase(0, result.value.find_first_not_of(" \t"));
+                result.value.erase(result.value.find_last_not_of(" \t") + 1);
+
+                size_t statusPos = line.find("status=");
+                if (statusPos != std::string::npos) {
+                    size_t statusEnd = line.find(';', statusPos);
+                    std::string statusPart;
+                    if (statusEnd != std::string::npos) {
+                        statusPart = line.substr(statusPos + 7, statusEnd - statusPos - 7);
+                    }
+                    else {
+                        statusPart = line.substr(statusPos + 7);
+                    }
+                    statusPart.erase(0, statusPart.find_first_not_of(" \t"));
+                    statusPart.erase(statusPart.find_last_not_of(" \t") + 1);
+                    result.status = statusPart;
+                }
+
+                size_t msgPos = line.find("msg=");
+                if (msgPos != std::string::npos) {
+                    result.message = line.substr(msgPos + 4);
+                    result.message.erase(0, result.message.find_first_not_of(" \t"));
+                    result.message.erase(result.message.find_last_not_of(" \t") + 1);
+                }
+
+                results[result.address] = result;
+            }
+
+            return !results.empty();
+        }
+        catch (const std::exception& e) {
+            setError(std::string("解析结果文件失败: ") + e.what());
+            return false;
+        }
+    }
+
+    inline void Client::log(const std::string& level, const std::string& message) {
+        if (m_logCallback) {
+            m_logCallback(level, message);
+        }
+    }
+
+    inline void Client::setError(const std::string& error) {
+        m_lastError = error;
+    }
+
+    inline std::string Client::getFullPath(const std::string& filename) const {
+        return m_config.basePath + filename;
+    }
+
+    inline bool Client::fileExists(const std::string& filepath) const {
+        return fs::exists(filepath);
+    }
+
+    inline bool Client::removeFile(const std::string& filepath) {
+        try {
+            if (fileExists(filepath)) {
+                fs::remove(filepath);
+                return true;
+            }
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    // -------------------- 静态方法实现 --------------------
+
+    inline std::string Client::makeReadCommand(const std::string& address) {
+        return "READ " + address;
+    }
+
+    inline std::string Client::makeReadCommand(uint64_t address) {
+        return "READ " + formatAddress(address);
+    }
+
+    inline std::string Client::makeWriteCommand(const std::string& address, int value) {
+        return "WRITE " + address + " " + std::to_string(value);
+    }
+
+    inline std::string Client::makeWriteCommand(uint64_t address, int value) {
+        return "WRITE " + formatAddress(address) + " " + std::to_string(value);
+    }
+
+    inline std::string Client::makePointerCommand(uint64_t base, uint64_t offset) {
+        return "POINTER " + formatAddress(base) + " " + formatAddress(offset);
+    }
+
+    inline std::string Client::makePointerChainCommand(uint64_t base, const std::vector<uint64_t>& offsets) {
+        std::ostringstream oss;
+        oss << "POINTER " << formatAddress(base);
+        for (uint64_t offset : offsets) {
+            oss << " " << formatAddress(offset);
+        }
+        return oss.str();
+    }
+
+    inline std::string Client::makePointerChainCommand(const std::string& base, const std::vector<uint64_t>& offsets) {
+        std::ostringstream oss;
+        oss << "POINTER " << base;
+        for (uint64_t offset : offsets) {
+            oss << " " << formatAddress(offset);
+        }
+        return oss.str();
+    }
+
+    inline std::string Client::makeModuleCommand(const std::string& moduleName) {
+        return "MODULE " + moduleName;
+    }
+
+    inline std::string Client::makeBreakpointCommand(const std::string& address) {
+        return "BREAKPOINT " + address;
+    }
+
+    inline std::string Client::makeRemoveBreakpointCommand(const std::string& address) {
+        return "REMOVE_BREAKPOINT " + address;
+    }
+
+    inline std::string Client::makeGetRegistersCommand() {
+        return "GETREGS";
+    }
+
+    inline std::string Client::formatAddress(uint64_t address) {
+        std::ostringstream oss;
+        oss << "0x" << std::hex << std::uppercase << address;
+        return oss.str();
+    }
+
+    inline uint64_t Client::parseAddress(const std::string& addressStr) {
+        try {
+            std::string str = addressStr;
+            if (str.substr(0, 2) == "0x" || str.substr(0, 2) == "0X") {
+                str = str.substr(2);
+            }
+            return std::stoull(str, nullptr, 16);
         }
         catch (...) {
             return 0;
         }
     }
 
-    inline bool Client::waitForResultChange(std::string& outContent, int timeoutMs) {
-        auto start = std::chrono::steady_clock::now();
-        uint64_t baseline = getFileMTime(config_.resultFile);
-
-        // 如果基线是0，说明文件不存在，等待它被创建
-        if (baseline == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            baseline = getFileMTime(config_.resultFile);
-        }
-
-        while (true) {
-            uint64_t current = getFileMTime(config_.resultFile);
-
-            if (current != 0 && current != baseline) {
-                // 短暂等待以确保写入完成
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-                try {
-                    std::ifstream ifs(config_.resultFile, std::ios::binary);
-                    if (ifs) {
-                        std::ostringstream oss;
-                        oss << ifs.rdbuf();
-                        outContent = oss.str();
-
-                        // 只有在成功读取内容时才更新状态
-                        if (!outContent.empty()) {
-                            lastResultMTime_ = fs::last_write_time(config_.resultFile);
-                            lastResultContent_ = outContent;
-                            idleCount_ = 0;
-                            return true;
-                        }
-                    }
-                }
-                catch (const std::exception& e) {
-                    lastError_ = std::string("read result failed: ") + e.what();
-                }
-            }
-
-            // 动态睡眠间隔
-            int sleepMs = (idleCount_ >= config_.idleThreshold) ? config_.idleMs : config_.pollMs;
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
-
-            idleCount_++;
-
-            // 检查超时
-            if (timeoutMs >= 0) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start).count();
-
-                if (elapsed > timeoutMs) {
-                    lastError_ = "wait for result timeout";
-                    log("ERROR", lastError_);
-                    return false;
-                }
-            }
-        }
-    }
-
-    inline std::map<std::string, CommandResult> Client::parseResults(const std::string& text) {
-        std::map<std::string, CommandResult> results;
-
-        std::istringstream iss(text);
-        std::string line;
-
-        while (std::getline(iss, line)) {
-            // 移除行尾的 \r
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-
-            if (line.empty() || line[0] == '#') continue;
-
-            // 解析格式: KEY = VALUE ; status=... ; msg=... ; ts=...
-            size_t eqPos = line.find('=');
-            if (eqPos == std::string::npos) continue;
-
-            CommandResult result;
-            result.address = stringPool_.intern(
-                line.substr(0, eqPos)).data();
-
-            trimString(result.address);
-
-            std::string rest = line.substr(eqPos + 1);
-            size_t semiPos = rest.find(';');
-
-            if (semiPos != std::string::npos) {
-                result.value = rest.substr(0, semiPos);
-            }
-            else {
-                result.value = rest;
-            }
-            trimString(result.value);
-
-            // 解析属性
-            size_t pos = 0;
-            while (pos < rest.size()) {
-                size_t nextSemi = rest.find(';', pos);
-                std::string token;
-
-                if (nextSemi == std::string::npos) {
-                    token = rest.substr(pos);
-                    pos = rest.size();
-                }
-                else {
-                    token = rest.substr(pos, nextSemi - pos);
-                    pos = nextSemi + 1;
-                }
-
-                trimString(token);
-                if (token.empty()) continue;
-
-                // 解析 key=value
-                size_t tokenEq = token.find('=');
-                if (tokenEq != std::string::npos) {
-                    std::string key = token.substr(0, tokenEq);
-                    std::string val = token.substr(tokenEq + 1);
-                    trimString(key);
-                    trimString(val);
-
-                    // 转换为小写比较
-                    for (auto& c : key) c = static_cast<char>(std::tolower(c));
-
-                    if (key == "status") {
-                        result.status = val;
-                    }
-                    else if (key == "msg") {
-                        result.message = val;
-                    }
-                    else if (key == "ts") {
-                        try {
-                            result.timestamp = std::stoll(val);
-                        }
-                        catch (...) {}
-                    }
-                }
-            }
-
-            results[result.address] = result;
-        }
-
-        return results;
-    }
-
-    inline bool Client::executeCommands(const std::vector<std::string>& commands,
-        std::map<std::string, CommandResult>& results,
-        int timeout) {
-
-        if (!initialized_.load()) {
-            lastError_ = "not initialized";
-            return false;
-        }
-
-        if (commands.empty()) {
-            lastError_ = "empty commands";
-            return false;
-        }
-
-        if (timeout < 0) timeout = config_.defaultTimeout;
-
-        // 构建命令文本
-        std::ostringstream oss;
-        for (const auto& cmd : commands) {
-            oss << cmd << "\n";
-        }
-        std::string cmdText = oss.str();
-
-        // 串行化写入
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        // +++ 修复：强制清理旧的结果文件 +++
-        if (!cleanupResultFile()) {
-            log("WARN", "清理结果文件失败，继续执行...");
-        }
-
-        // 原子写入命令文件
-        if (!atomicWriteFile(config_.commandFile, cmdText)) {
-            log("ERROR", lastError_);
-            return false;
-        }
-
-        log("DEBUG", std::string("Executed ") + std::to_string(commands.size()) + " commands");
-
-        // 等待结果
-        std::string resultText;
-        if (!waitForResultChange(resultText, timeout)) {
-            return false;
-        }
-
-        // 解析结果
-        results = parseResults(resultText);
-
-        // +++ 修复：清理字符串池，避免内存泄漏 +++
-        stringPool_.clear();
-
-        return !results.empty();
-    }
-
-    inline bool Client::readMemory(const std::string& address,
-        CommandResult& result, int timeout) {
-
-        std::map<std::string, CommandResult> results;
-        std::vector<std::string> cmds = { "READ " + address };
-
-        if (!executeCommands(cmds, results, timeout)) return false;
-
-        if (!results.empty()) {
-            result = results.begin()->second;
-            return result.isOK();
-        }
-
-        lastError_ = "no result returned";
-        return false;
-    }
-
-    inline bool Client::writeMemory(const std::string& address,
-        const std::string& value, CommandResult& result, int timeout) {
-
-        std::map<std::string, CommandResult> results;
-        std::vector<std::string> cmds = { "WRITE " + address + " " + value };
-
-        if (!executeCommands(cmds, results, timeout)) return false;
-
-        if (!results.empty()) {
-            result = results.begin()->second;
-            return result.isOK();
-        }
-
-        lastError_ = "no result returned";
-        return false;
-    }
-
-    inline bool Client::getModuleBase(const std::string& moduleName,
-        CommandResult& result, int timeout) {
-
-        std::map<std::string, CommandResult> results;
-        std::vector<std::string> cmds = { "MODULE " + moduleName };
-
-        if (!executeCommands(cmds, results, timeout)) return false;
-
-        if (!results.empty()) {
-            result = results.begin()->second;
-            return result.isOK();
-        }
-
-        lastError_ = "no result returned";
-        return false;
-    }
-
-    inline bool Client::readPointer(const std::string& baseAddr,
-        const std::vector<std::string>& offsets, CommandResult& result, int timeout) {
-
-        std::ostringstream oss;
-        oss << "POINTER " << baseAddr;
-        for (const auto& offset : offsets) {
-            oss << " " << offset;
-        }
-
-        std::map<std::string, CommandResult> results;
-        if (!executeCommands({ oss.str() }, results, timeout)) return false;
-
-        if (!results.empty()) {
-            result = results.begin()->second;
-            return result.isOK();
-        }
-
-        lastError_ = "no result returned";
-        return false;
-    }
-
-    inline bool Client::readMemoryWithRetry(const std::string& address,
-        CommandResult& result, int maxRetries, int timeout) {
-
-        for (int i = 0; i < maxRetries; ++i) {
-            if (readMemory(address, result, timeout)) {
-                return true;
-            }
-
-            if (i < maxRetries - 1) {
-                log("WARN", std::string("读取失败，重试 ") + std::to_string(i + 1) + "/" + std::to_string(maxRetries));
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-
-        return false;
-    }
-
-    inline bool Client::sendStopSignal() {
-        try {
-            ensureDirectory();
-            std::ofstream ofs(config_.stopFlag, std::ios::binary);
-            if (!ofs) {
-                lastError_ = "cannot create stop flag";
-                return false;
-            }
-            ofs << "STOP";
-            ofs.close();
-            log("INFO", "Stop signal sent");
-            return true;
-        }
-        catch (const std::exception& e) {
-            lastError_ = std::string("sendStopSignal failed: ") + e.what();
-            return false;
-        }
-    }
-
 } // namespace CEBridge
 
-
-#endif // CE_BRIDGE_OPTIMIZED_H
+#endif // CE_BRIDGE_H

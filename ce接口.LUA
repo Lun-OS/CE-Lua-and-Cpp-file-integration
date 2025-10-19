@@ -1,10 +1,15 @@
--- ============================================================
+﻿-- ============================================================
+-- CE Lua to C++ File Communication Bridge Script (High-Performance Fix)
 -- CE Lua 与 C++ 文件通讯桥接脚本（高性能修复版）
+-- Version: 2.4 (Fixed multiple read issues)
 -- 版本: 2.4 (修复多次读取问题)
+-- Legal risks are borne by yourself
 -- 法律风险由自己承担
+-- Author: Lun. github:Lun-OS  QQ:1596534228
 -- 作者：Lun. github:Lun-OS  QQ:1596534228
 -- ============================================================
 
+-- -------------------- Configuration Area --------------------
 -- -------------------- 配置区 --------------------
 local CONFIG = {
     basePath = (os.getenv("LOCALAPPDATA") or ".") .. "\\Temp\\QAQ\\",
@@ -18,8 +23,9 @@ local CONFIG = {
     idleThreshold = 5,
     logFlushInterval = 10000,
     maxCacheSize = 100,
-    batchReadSize = 64,  -- 批量读取缓冲区大小
+    batchReadSize = 64,  -- Batch read buffer size / 批量读取缓冲区大小
 
+    -- New: Whether to enable logging (default off)
     -- 新增：是否启用日志（默认关闭）
     enableLogging = false,
 }
