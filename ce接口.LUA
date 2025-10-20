@@ -1,4 +1,4 @@
-﻿-- ============================================================
+-- ============================================================
 -- CE Lua to C++ File Communication Bridge Script (High-Performance Fix)
 -- CE Lua 与 C++ 文件通讯桥接脚本（高性能修复版）
 -- Version: 2.4 (Fixed multiple read issues)
@@ -340,11 +340,15 @@ local function cmdRead(addrStr, dataType)
         return createResult(0, "ERR", "地址解析失败: " .. tostring(addrStr))
     end
 
-    dataType = dataType or "int"
+    dataType = (dataType and dataType:lower()) or "int"
 
     local success, value = pcall(function()
         if dataType == "int" or dataType == "dword" then
             return readInteger(addr)
+        elseif dataType == "qword" or dataType == "int64" or dataType == "i64" then
+            return readQword(addr)
+        elseif dataType == "ptr" then
+            return readPointer(addr)
         elseif dataType == "float" then
             return readFloat(addr)
         elseif dataType == "double" then
@@ -376,11 +380,19 @@ local function cmdWrite(addrStr, valueStr, dataType)
         return createResult(0, "ERR", "数值解析失败")
     end
 
-    dataType = dataType or "int"
+    dataType = (dataType and dataType:lower()) or "int"
 
     local success, err = pcall(function()
         if dataType == "int" or dataType == "dword" then
             writeInteger(addr, value)
+        elseif dataType == "qword" or dataType == "int64" or dataType == "i64" then
+            writeQword(addr, value)
+        elseif dataType == "ptr" then
+            if targetIs64Bit and targetIs64Bit() then
+                writeQword(addr, value)
+            else
+                writeInteger(addr, value)
+            end
         elseif dataType == "float" then
             writeFloat(addr, value)
         elseif dataType == "double" then
@@ -401,7 +413,7 @@ end
 
 -- 优化：多层指针解析 - 批量读取减少函数调用
 local function cmdPointer(baseStr, ...)
-    local offsets = {...}
+    local args = {...}
 
     -- 解析基址
     local currentAddr = parseAddressExpression(baseStr)
@@ -409,31 +421,56 @@ local function cmdPointer(baseStr, ...)
         return createResult(0, "ERR", "基址解析失败: " .. tostring(baseStr))
     end
 
-    -- 优化：批量解析偏移量
+    -- 识别末尾类型标记（如 int/dword/qword/float/double/byte/ptr/address）
+    local finalType = nil
+    if #args >= 1 then
+        local last = tostring(args[#args])
+        local lname = last:lower()
+        if lname == "int" or lname == "dword" or lname == "qword" or lname == "float" or lname == "double" or lname == "byte" or lname == "ptr" or lname == "address" or lname == "addr" then
+            finalType = lname
+            table.remove(args, #args)
+        end
+    end
+
+    -- 批量解析偏移量
     local parsedOffsets = {}
-    for i = 1, #offsets do
-        local offset = parseNumber(offsets[i])
+    for i = 1, #args do
+        local offset = parseNumber(args[i])
         if not offset then
-            return createResult(0, "ERR", string.format("第%d层偏移解析失败: %s", i, offsets[i]))
+            return createResult(0, "ERR", string.format("第%d层偏移解析失败: %s", i, tostring(args[i])))
         end
         parsedOffsets[i] = offset
     end
 
-    -- 逐层解析指针
+    -- 逐层解析指针（指针宽度自适应）
     for i = 1, #parsedOffsets do
-        local success, ptrValue = pcall(readInteger, currentAddr)
-
-        if not success or not ptrValue then
+        local ok, ptrValue = pcall(readPointer, currentAddr)
+        if not ok or not ptrValue then
             return createResult(0, "ERR", string.format("第%d层指针读取失败 (地址: 0x%X)", i, currentAddr))
         end
-
         currentAddr = ptrValue + parsedOffsets[i]
     end
 
-    -- 读取最终地址的值
-    local success, finalValue = pcall(readInteger, currentAddr)
+    -- 根据最终类型读取值；默认按 dword
+    local ok, finalValue
+    if finalType == "float" then
+        ok, finalValue = pcall(readFloat, currentAddr)
+    elseif finalType == "double" then
+        ok, finalValue = pcall(readDouble, currentAddr)
+    elseif finalType == "byte" then
+        ok, finalValue = pcall(readBytes, currentAddr, 1)
+        if ok and type(finalValue) == "table" then finalValue = finalValue[1] end
+    elseif finalType == "qword" then
+        ok, finalValue = pcall(readQword, currentAddr)
+    elseif finalType == "ptr" then
+        ok, finalValue = pcall(readPointer, currentAddr)
+    elseif finalType == "address" or finalType == "addr" then
+        return createResult(string.format("0x%X", currentAddr), "OK", string.format("最终地址: 0x%X", currentAddr))
+    else
+        ok, finalValue = pcall(readInteger, currentAddr)
+    end
 
-    if success and finalValue ~= nil then
+    if ok and finalValue ~= nil then
         return createResult(finalValue, "OK", string.format("最终地址: 0x%X", currentAddr))
     else
         return createResult(0, "ERR", string.format("读取最终值失败 (地址: 0x%X)", currentAddr))
@@ -572,13 +609,25 @@ local function executeCommand(line)
         return parts[2], cmdWrite(parts[2], parts[3], dataType)
 
     elseif cmd == "POINTER" and partCount >= 3 then
-        -- 优化：直接使用parts数组，避免table.unpack
+        -- 识别末尾类型标记
+        local known = { int=true, dword=true, qword=true, float=true, double=true, byte=true, ptr=true, address=true, addr=true }
+        local finalType = nil
+        if known[(parts[partCount] or ""):lower()] then
+            finalType = parts[partCount]
+            partCount = partCount - 1
+        end
+        -- 构造偏移数组
         local offsets = {}
         for i = 3, partCount do
             offsets[i - 2] = parts[i]
         end
         local key = parts[2] .. "+" .. table.concat(offsets, "+")
-        return key, cmdPointer(parts[2], table.unpack(offsets))
+        if finalType then key = key .. ":" .. finalType end
+        if finalType then
+            return key, cmdPointer(parts[2], table.unpack(offsets), finalType)
+        else
+            return key, cmdPointer(parts[2], table.unpack(offsets))
+        end
 
     elseif cmd == "MODULE" and partCount >= 2 then
         return parts[2], cmdModule(parts[2])
